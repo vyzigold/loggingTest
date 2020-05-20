@@ -10,10 +10,8 @@ import(
 
 	"github.com/infrawatch/apputils/connector"
 	"github.com/infrawatch/apputils/logging"
+	"github.com/infrawatch/apputils/config"
 )
-
-const QDRURL = "amqp://127.0.0.1:5672/lokean/logs"
-const LOKIURL = "http://127.0.0.1:3100"
 
 type Log struct {
 	Timestamp int    `json:"timestamp"`
@@ -23,10 +21,10 @@ type Log struct {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, `./loggingTest count_of_logs_sent (default is 5 if not specified)`)
+	fmt.Fprintln(os.Stderr, `./loggingTest config_path count_of_logs_sent (default is 5 if not specified)`)
 }
 
-func sendLogs(sender *connector.AMQPSender, testUniqueNum int, count int) error {
+func sendLogs(sender chan interface{}, testUniqueNum int, count int) error {
 	timestamp := int(time.Now().Unix() * 1000)
 	log := Log {
 		Level: "TEST",
@@ -39,21 +37,20 @@ func sendLogs(sender *connector.AMQPSender, testUniqueNum int, count int) error 
 		if err != nil {
 			return err
 		}
-		sender.Send(string(l))
-		<-sender.GetAckChannel()
+		sender <- connector.AMQP10Message{Address: "lokean/logs", Body: string(l)}
 	}
 	return nil
 }
 
-func checkLogs(lokiClient *connector.LokiClient, testUniqueNum int, count int, logger *logging.Logger) (bool, error) {
+func checkLogs(lokiConnector *connector.LokiConnector, testUniqueNum int, count int, logger *logging.Logger) (bool, error) {
 	source := fmt.Sprintf("loggingTest%d", testUniqueNum)
-	queryString := fmt.Sprintf("{source=\"%s\",level=\"TEST\"}", source)
+	queryString := fmt.Sprintf("{source=\"%s\"}", source)
 	logger.Metadata(map[string]interface{}{
 		"queryString": queryString,
 	})
 	logger.Debug("Querying logs")
 
-	messages, err := lokiClient.Query(queryString)
+	messages, err := lokiConnector.Query(queryString, 0, count)
 	if err != nil {
 		return false, err
 	}
@@ -69,11 +66,13 @@ func checkLogs(lokiClient *connector.LokiClient, testUniqueNum int, count int, l
 	for i := 0; i < count; i++ {
 		found := false
 		for _, message := range messages {
-			logNum, err := strconv.Atoi(message.Message)
+			var logNum int
+			_, err := fmt.Sscanf(message.Message, "[TEST] %d", &logNum)
 			if err != nil {
 				logger.Metadata(map[string]interface{}{
-					"expected": "number",
+					"expected": "[TEST] number",
 					"got": message.Message,
+					"error": err,
 				})
 				logger.Info("A wrong message format returned from loki")
 			}
@@ -95,19 +94,19 @@ func checkLogs(lokiClient *connector.LokiClient, testUniqueNum int, count int, l
 }
 
 func main() {
-	var count int
-	if len(os.Args) == 1 {
-		count = 5
-	} else if len(os.Args) == 2 {
+	count := 5
+	if len(os.Args) != 2 && len(os.Args) != 3 {
+		printUsage()
+		os.Exit(1)
+	}
+	configPath := os.Args[1]
+	if len(os.Args) == 3 {
 		var err error
-		count, err = strconv.Atoi(os.Args[1])
+		count, err = strconv.Atoi(os.Args[2])
 		if err != nil {
 			printUsage()
 			os.Exit(1)
 		}
-	} else {
-		printUsage()
-		os.Exit(1)
 	}
 	generator := rand.New(rand.NewSource(time.Now().UnixNano()))
 	testUniqueNum := generator.Int()
@@ -119,31 +118,87 @@ func main() {
 	}
 	defer logger.Destroy()
 
-	sender := connector.NewAMQPSender(QDRURL, true, logger)
-	lokiClient, err := connector.NewLokiConnector(LOKIURL, 2, 100)
+	metadata := map[string][]config.Parameter{
+		"amqp1": []config.Parameter{
+			config.Parameter{Name: "connection", Tag: "", Default: "amqp://localhost:5672/lokean/logs", Validators: []config.Validator{}},
+			config.Parameter{Name: "send_timeout", Tag: "", Default: 2, Validators: []config.Validator{config.IntValidatorFactory()}},
+			config.Parameter{Name: "client_name", Tag: "", Default: "test", Validators: []config.Validator{}},
+		},
+		"loki": []config.Parameter{
+			config.Parameter{Name: "connection", Tag: "", Default: "http://localhost:3100", Validators: []config.Validator{}},
+			config.Parameter{Name: "batch_size", Tag: "", Default: 20, Validators: []config.Validator{config.IntValidatorFactory()}},
+			config.Parameter{Name: "max_wait_time", Tag: "", Default: 100, Validators: []config.Validator{config.IntValidatorFactory()}},
+		},
+	}
+	conf := config.NewINIConfig(metadata, logger)
+	err = conf.Parse(configPath)
 	if err != nil {
 		logger.Metadata(map[string]interface{}{
 			"error": err,
 		})
-		logger.Error("Error while initializing lokiClient")
+		logger.Error("Error while parsing config file")
+		return
 	}
 
-	err = sendLogs(sender, testUniqueNum, count)
+	amqp, err := connector.NewAMQP10Connector(conf, logger)
+	if err != nil {
+		logger.Metadata(map[string]interface{}{
+			"error": err,
+		})
+		logger.Error("Couldn't connect to AMQP")
+		return
+	}
+	err = amqp.Connect()
+	if err != nil {
+		logger.Metadata(map[string]interface{}{
+			"error": err,
+		})
+		logger.Error("Error while connecting to AMQP")
+		return
+	}
+	amqpReceiver := make(chan interface{})
+	amqpSender := make(chan interface{})
+	amqp.Start(amqpReceiver, amqpSender)
+
+	err = sendLogs(amqpSender, testUniqueNum, count)
 	if err != nil {
 		logger.Metadata(map[string]interface{}{
 			"error": err,
 		})
 		logger.Error("Error while sending logs")
+		return
 	}
 
+	// Wait a bit, so that the logs get properly saved in Loki
 	time.Sleep(500 * time.Millisecond)
 
-	passed, err := checkLogs(lokiClient, testUniqueNum, count, logger)
+	loki, err := connector.NewLokiConnector(conf, logger)
+	if err != nil {
+		logger.Metadata(map[string]interface{}{
+			"error": err,
+		})
+		logger.Error("Couldn't connect to Loki")
+		return
+	}
+	err = loki.Connect()
+	if err != nil {
+		logger.Metadata(map[string]interface{}{
+			"error": err,
+		})
+		logger.Error("Couldn't connect to Loki")
+		return
+	}
+	lokiReceiver := make(chan interface{})
+	lokiSender := make(chan interface{})
+	loki.Start(lokiReceiver, lokiSender)
+
+	passed, err := checkLogs(loki, testUniqueNum, count, logger)
 	if err != nil {
 		logger.Metadata(map[string]interface{}{
 			"error": err,
 		})
 		logger.Error("Error while checking logs")
+		return
 	}
 	if passed {
 		logger.Warn("SUCCESS!")
